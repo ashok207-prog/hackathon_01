@@ -1,8 +1,8 @@
 import { icon } from '../utils/icons.js';
-import { escapeHtml } from '../utils/format.js';
+import { escapeHtml, formatTimeRange } from '../utils/format.js';
 
 export function renderKitchenView(state) {
-  const { orders, slots, kdsBatchSlot } = state;
+  const { orders, slots, kdsBatchSlot, prepAdjustments = [] } = state;
 
   // Exclude already collected/cancelled orders from active KDS prep queue
   const activeOrders = orders.filter(
@@ -86,6 +86,28 @@ export function renderKitchenView(state) {
                   .join('')
           }
         </div>
+        ${
+          prepAdjustments.length > 0
+            ? `
+        <div class="kds-prep-boosts" aria-label="Manager Recommended Batch Prep Targets">
+          <span class="kds-boost-label">${icon('sparkles', 14)} Manager Batch Prep Boost:</span>
+          ${prepAdjustments
+            .filter((adj) => kdsBatchSlot === 'all' || adj.slotId === kdsBatchSlot)
+            .map((adj) => {
+              const sign = adj.deltaQty > 0 ? '+' : '';
+              return `
+                <span class="kds-boost-pill" title="${escapeHtml(adj.note || adj.title)}">
+                  <strong>${sign}${adj.deltaQty}×</strong>
+                  <span>${escapeHtml(adj.itemName)}</span>
+                  <span class="kds-boost-slot">(${escapeHtml(adj.slotId)})</span>
+                </span>
+              `;
+            })
+            .join('')}
+        </div>
+        `
+            : ''
+        }
       </section>
 
       <section class="kds-slots-board" aria-label="Slot-Grouped Kitchen Tickets">
@@ -128,7 +150,9 @@ export function renderKitchenView(state) {
                             }">
                               ${
                                 ord.orderType === 'dine-in'
-                                  ? `Dine-In • T${ord.tableNumber || 1}`
+                                  ? `Dine-In • T${ord.tableNumber || 1} • ${escapeHtml(
+                                      formatTimeRange(ord.slotId, ord.durationMins || 30).compactRange
+                                    )} • ${Number(ord.durationMins) || 30}m`
                                   : 'Takeaway'
                               }
                             </span>

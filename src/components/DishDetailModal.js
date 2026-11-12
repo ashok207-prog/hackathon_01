@@ -18,7 +18,7 @@ export function renderDishDetailModal(state) {
           <button type="button" class="modal-close-float" data-action="close-dish-modal" aria-label="Close dish details">
             ${icon('close', 18)}
           </button>
-          ${getDishArt(dish.artKey, dish.isVeg, dish.name)}
+          ${getDishArt(dish.artKey, dish.isVeg, dish.name, dish.image)}
         </div>
         <div class="modal-body">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -56,11 +56,11 @@ export function renderDishDetailModal(state) {
                 <div class="macro-lbl">Protein</div>
               </div>
               <div class="macro-box">
-                <div class="macro-val">${dish.carbs || 38}g</div>
+                <div class="macro-val">${dish.carbs ?? 38}g</div>
                 <div class="macro-lbl">Carbs</div>
               </div>
               <div class="macro-box">
-                <div class="macro-val">${dish.fat || 12}g</div>
+                <div class="macro-val">${dish.fat ?? 12}g</div>
                 <div class="macro-lbl">Fat</div>
               </div>
             </div>

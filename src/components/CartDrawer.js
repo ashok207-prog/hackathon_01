@@ -1,8 +1,22 @@
 import { icon } from '../utils/icons.js';
-import { escapeHtml, formatRupees } from '../utils/format.js';
+import { escapeHtml, formatRupees, formatTimeRange } from '../utils/format.js';
+import { CANTEEN_TABLES } from '../data/mockSeed.js';
+import { renderDurationSelector } from './DurationSelector.js';
 
 export function renderCartDrawer(state) {
-  const { isCartOpen, cart, menu, slots, selectedSlotId, orderType, studentName, isSubmittingOrder } = state;
+  const {
+    isCartOpen,
+    cart,
+    menu,
+    slots,
+    orders = [],
+    selectedSlotId,
+    selectedTableNumber,
+    selectedDurationMins = 30,
+    orderType,
+    studentName,
+    isSubmittingOrder
+  } = state;
 
   const lines = cart
     .map((line) => {
@@ -16,6 +30,10 @@ export function renderCartDrawer(state) {
   const totalProtein = lines.reduce((sum, l) => sum + l.dish.protein * l.qty, 0);
 
   const activeSlot = slots.find((s) => s.id === selectedSlotId);
+  const chosenTable =
+    orderType === 'dine-in' && selectedTableNumber
+      ? CANTEEN_TABLES.find((t) => t.number === Number(selectedTableNumber))
+      : null;
   const isSlotBlocked =
     !activeSlot ||
     activeSlot.isFoodFull ||
@@ -123,6 +141,39 @@ export function renderCartDrawer(state) {
                 </select>
               </div>
             </div>
+
+            ${
+              orderType === 'dine-in'
+                ? `
+              <div class="cart-table-picker">
+                <div>
+                  <div class="cart-table-lbl">Canteen Table</div>
+                  <div class="cart-table-val">
+                    ${
+                      chosenTable
+                        ? `${escapeHtml(chosenTable.id)} • ${escapeHtml(chosenTable.label)} (${escapeHtml(chosenTable.zone)})`
+                        : 'Auto-assign open table'
+                    }
+                  </div>
+                </div>
+                <button type="button" class="btn-pick-table-inline" data-action="open-table-map">
+                  ${icon('table', 13)}
+                  <span>${chosenTable ? 'Change' : 'Pick Table'}</span>
+                </button>
+              </div>
+              <div style="margin-top:10px;">
+                ${renderDurationSelector({
+                  slots,
+                  orders,
+                  selectedSlotId,
+                  selectedDurationMins,
+                  selectedTableNumber,
+                  compact: true
+                })}
+              </div>
+            `
+                : ''
+            }
           </div>
         `
         }
@@ -134,8 +185,16 @@ export function renderCartDrawer(state) {
         <div class="drawer-footer">
           <div class="summary-line">
             <span>Slot &amp; Mode</span>
-            <span>${escapeHtml(selectedSlotId || 'None')} • ${
-              orderType === 'dine-in' ? 'Dine-In Table Reserved' : 'Takeaway Counter'
+            <span>${
+              orderType === 'dine-in'
+                ? `${escapeHtml(
+                    formatTimeRange(selectedSlotId || '12:30', selectedDurationMins).compactRange
+                  )} (${selectedDurationMins}m) • ${
+                    chosenTable
+                      ? `Dine-In (${escapeHtml(chosenTable.id)})`
+                      : 'Dine-In Table Reserved'
+                  }`
+                : `${escapeHtml(selectedSlotId || 'None')} • Takeaway Counter`
             }</span>
           </div>
           <div class="summary-total">

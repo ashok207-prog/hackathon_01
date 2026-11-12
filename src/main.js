@@ -3,17 +3,26 @@ import {
   setApiUserRole,
   getStaffSession,
   setStaffSession,
-  clearStaffSession
+  clearStaffSession,
+  normalizeOrderRef
 } from './services/apiClient.js';
-import { CURRENT_STUDENT_ID, CURRENT_STUDENT_NAME } from './data/mockSeed.js';
+import { CURRENT_STUDENT_ID, CURRENT_STUDENT_NAME, CANTEEN_TABLES } from './data/mockSeed.js';
 import { parsePlainLanguageOrder } from './utils/nlpOrderParser.js';
-import { escapeHtml } from './utils/format.js';
+import {
+  PEAK_MAX_DURATION_MINS,
+  computeTablesAvailability,
+  escapeHtml,
+  formatLiveTableCountdown,
+  formatTimeRange,
+  isPeakSlot
+} from './utils/format.js';
 import { icon } from './utils/icons.js';
 
 import { renderHeader } from './components/Header.js';
 import { renderOrderReadyBanner } from './components/OrderReadyBanner.js';
 import { renderCartDrawer } from './components/CartDrawer.js';
 import { renderDishDetailModal } from './components/DishDetailModal.js';
+import { renderTableAvailabilityModal } from './components/TableAvailabilityModal.js';
 import { renderStudentView, renderNlpLivePreview } from './views/StudentView.js';
 import { renderKitchenView } from './views/KitchenView.js';
 import { renderManagerView } from './views/ManagerView.js';
@@ -41,10 +50,16 @@ const state = {
   menuFilter: 'all', // 'all' | 'veg' | 'non-veg' | 'new'
   orderType: 'takeaway', // 'takeaway' | 'dine-in'
   selectedSlotId: '12:30',
+  selectedTableNumber: null,
+  selectedDurationMins: 15,
+  userExplicitDuration: false,
   kdsBatchSlot: 'all',
+  managerTab: 'all', // 'all' | 'operations' | 'analytics'
+  prepAdjustments: [],
   cart: [], // [{ itemId, qty }]
   studentName: CURRENT_STUDENT_NAME,
   isCartOpen: false,
+  isTableMapOpen: false,
   isSubmittingOrder: false,
   activeDishModalId: null,
   nlpQuery: '',
@@ -55,9 +70,49 @@ const state = {
   dismissedReadyIds: []
 };
 
+// Deduplicates audio/toast Ready celebrations across BroadcastChannel, storage events, and 1.5s polling
+const notifiedOrderIds = new Set();
+let heartbeatTimerId = null;
+let isHeartbeatPolling = false;
+
 /* ==========================================================================
-   Toast Notifications
+   Toast Notifications & Gentle Ready Chime (Web Audio API)
    ========================================================================== */
+
+function playOrderReadyChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+
+    const notes = [523.25, 659.25, 783.99]; // C5 -> E5 -> G5 soft chime
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+
+      const start = ctx.currentTime + idx * 0.1;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.075, start + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.34);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.36);
+    });
+
+    window.setTimeout(() => {
+      ctx.close().catch(() => {});
+    }, 900);
+  } catch {
+    // Safely ignore if browser autoplay policy blocks Web Audio API
+  }
+}
 
 function showToast(title, message = '', variant = 'info', duration = 3800) {
   const toastEl = document.createElement('div');
@@ -65,12 +120,12 @@ function showToast(title, message = '', variant = 'info', duration = 3800) {
   toastEl.innerHTML = `
     <div style="margin-top:2px;color:${
       variant === 'success'
-        ? 'var(--emerald-500)'
+        ? 'var(--emerald)'
         : variant === 'warning'
-        ? 'var(--amber-500)'
+        ? 'var(--amber)'
         : variant === 'error'
-        ? 'var(--crimson-500)'
-        : 'var(--brand-400)'
+        ? 'var(--crimson)'
+        : 'var(--sage-accent)'
     }">
       ${icon(variant === 'success' ? 'checkCircle' : variant === 'error' || variant === 'warning' ? 'alert' : 'sparkles', 18)}
     </div>
@@ -108,10 +163,11 @@ function navigateTo(route) {
 
   if (route === 'staff' && state.staffSession) {
     setApiUserRole(state.staffSession.role);
+    renderApp();
   } else {
     setApiUserRole('student');
+    syncAllData({ type: 'ROUTE_RETURN' });
   }
-  renderApp();
 }
 
 /* ==========================================================================
@@ -134,9 +190,46 @@ function findNextOpenSlot(slots, preferredId, mode) {
 
 function ensureValidSelectedSlot() {
   const current = state.slots.find((s) => s.id === state.selectedSlotId);
-  if (current && !isSlotFullForMode(current, state.orderType)) return;
+  if (current && !isSlotFullForMode(current, state.orderType)) {
+    ensureValidSelectedTable();
+    return;
+  }
   const fallback = state.slots.find((s) => !isSlotFullForMode(s, state.orderType));
   if (fallback) state.selectedSlotId = fallback.id;
+  ensureValidSelectedTable();
+}
+
+function ensureValidSelectedTable() {
+  if (!state.selectedTableNumber) return;
+  const activeSlot = state.slots.find((s) => s.id === state.selectedSlotId);
+  const booked = activeSlot?.bookedTableNumbers || [];
+  if (booked.includes(Number(state.selectedTableNumber))) {
+    state.selectedTableNumber = null;
+  }
+}
+
+function ensureValidDurationForSelectedTable() {
+  if (!state.selectedTableNumber) return;
+  const avail = computeTablesAvailability(
+    state.orders,
+    CANTEEN_TABLES,
+    state.selectedSlotId,
+    state.selectedDurationMins
+  );
+  const entry = avail.find((t) => t.number === Number(state.selectedTableNumber));
+  if (entry && entry.hasConflict && entry.maxAllowedDurationMins >= 15) {
+    const capped = [60, 45, 30, 15].find((d) => d <= entry.maxAllowedDurationMins) || 15;
+    state.selectedDurationMins = capped;
+  }
+}
+
+function enforceDurationForSlot(targetSlotId = state.selectedSlotId) {
+  if (isPeakSlot(targetSlotId, state.slots)) {
+    state.selectedDurationMins = PEAK_MAX_DURATION_MINS;
+  } else if (state.selectedDurationMins === PEAK_MAX_DURATION_MINS && !state.userExplicitDuration) {
+    state.selectedDurationMins = 30;
+  }
+  ensureValidDurationForSelectedTable();
 }
 
 function trySelectSlot(requestedSlotId, mode = state.orderType) {
@@ -146,6 +239,8 @@ function trySelectSlot(requestedSlotId, mode = state.orderType) {
   if (!isSlotFullForMode(target, mode)) {
     state.selectedSlotId = target.id;
     state.slotSuggestion = null;
+    ensureValidSelectedTable();
+    enforceDurationForSlot(target.id);
     triggerSlotFlash(target.id);
     return { selected: target.id, redirected: false };
   }
@@ -159,6 +254,8 @@ function trySelectSlot(requestedSlotId, mode = state.orderType) {
   const nextOpen = findNextOpenSlot(state.slots, target.id, mode);
   if (nextOpen) {
     state.selectedSlotId = nextOpen.id;
+    ensureValidSelectedTable();
+    enforceDurationForSlot(nextOpen.id);
     state.slotSuggestion = {
       fullSlotId: target.id,
       suggestedSlotId: nextOpen.id,
@@ -229,7 +326,8 @@ function handleNlpSubmit() {
   const parsed = parsePlainLanguageOrder(
     query,
     state.menu,
-    state.slots.map((s) => s.id)
+    state.slots.map((s) => s.id),
+    state.slots
   );
 
   if (parsed.items.length === 0 && parsed.outOfStockItems.length === 0) {
@@ -262,9 +360,36 @@ function handleNlpSubmit() {
     triggerSlotFlash(state.selectedSlotId);
   }
 
+  let wasCappedByPeak = Boolean(parsed.wasDurationCapped);
+  if (parsed.durationMins) {
+    const targetIsPeak = isPeakSlot(state.selectedSlotId, state.slots);
+    if (targetIsPeak && parsed.durationMins > PEAK_MAX_DURATION_MINS) {
+      wasCappedByPeak = true;
+      state.selectedDurationMins = PEAK_MAX_DURATION_MINS;
+    } else {
+      state.selectedDurationMins = targetIsPeak ? PEAK_MAX_DURATION_MINS : parsed.durationMins;
+      if (!targetIsPeak) state.userExplicitDuration = true;
+    }
+    ensureValidDurationForSelectedTable();
+  } else {
+    enforceDurationForSlot(state.selectedSlotId);
+  }
+
+  if (wasCappedByPeak) {
+    showToast(
+      'Peak Hour Duration Limit',
+      'Adjusted table duration to 15 mins (Peak Hour Limit).',
+      'warning',
+      4500
+    );
+  }
+
   const addedSummary = parsed.items.map((e) => `${e.quantity}× ${e.item.name}`).join(', ');
   const oosSummary = parsed.outOfStockItems.map((e) => e.item.name).join(', ');
-  const modeLabel = state.orderType === 'dine-in' ? 'Dine-In' : 'Takeaway';
+  const modeLabel =
+    state.orderType === 'dine-in'
+      ? `Dine-In • ${state.selectedDurationMins} mins`
+      : 'Takeaway';
 
   if (parsed.items.length > 0 && !oosSummary) {
     state.nlpFeedback = {
@@ -293,45 +418,126 @@ function handleNlpSubmit() {
    Data Sync & Master Render
    ========================================================================== */
 
+function notifyStudentOrderReady(order) {
+  if (!order) return;
+  const orderKey = normalizeOrderRef(order.id);
+  if (notifiedOrderIds.has(orderKey)) return;
+
+  notifiedOrderIds.add(orderKey);
+  state.dismissedReadyIds = state.dismissedReadyIds.filter(
+    (id) => normalizeOrderRef(id) !== orderKey
+  );
+
+  const location =
+    order.orderType === 'dine-in'
+      ? `Table T${order.tableNumber || 1}`
+      : 'Takeaway Counter';
+
+  playOrderReadyChime();
+  showToast(
+    `🎉 Order #${order.token} is Ready!`,
+    `Please collect it at ${location} (${order.slotId}).`,
+    'success',
+    6500
+  );
+}
+
 async function syncAllData(syncMeta = {}) {
-  const [menu, slots, orders] = await Promise.all([
+  const [menu, slots, orders, prepAdjustments] = await Promise.all([
     apiClient.getMenu('all'),
     apiClient.getSlots(),
-    apiClient.getOrders()
+    apiClient.getOrders(),
+    apiClient.getPrepAdjustments()
   ]);
 
   const hadPriorOrders = state.orders.length > 0;
-  const prevReadyIds = new Set(
+  const prevReadyKeys = new Set(
     state.orders
       .filter((o) => o.studentId === CURRENT_STUDENT_ID && o.status === 'READY')
-      .map((o) => o.id)
+      .map((o) => normalizeOrderRef(o.id))
   );
 
   state.menu = menu;
   state.slots = slots;
   state.orders = orders;
+  state.prepAdjustments = Array.isArray(prepAdjustments) ? prepAdjustments : [];
 
-  const newlyReady = orders.find(
-    (o) =>
-      o.studentId === CURRENT_STUDENT_ID &&
-      o.status === 'READY' &&
-      !prevReadyIds.has(o.id)
+  const readyStudentOrders = orders.filter(
+    (o) => o.studentId === CURRENT_STUDENT_ID && o.status === 'READY'
   );
 
-  if (newlyReady && hadPriorOrders) {
-    state.dismissedReadyIds = state.dismissedReadyIds.filter((id) => id !== newlyReady.id);
-    if (syncMeta.type === 'CROSS_TAB_SYNC' && state.route === 'student') {
-      showToast(
-        `Order Ready! • #${newlyReady.token}`,
-        `Ready for pickup at ${newlyReady.slotId}!`,
-        'success',
-        5500
-      );
+  if (state.route === 'student') {
+    const isRealtimeSync =
+      syncMeta.type === 'CROSS_TAB_SYNC' ||
+      syncMeta.type === 'ORDER_STATUS_UPDATED' ||
+      syncMeta.type === 'HEARTBEAT_SYNC' ||
+      syncMeta.type === 'ROUTE_RETURN';
+
+    const newlyReady = readyStudentOrders.find((o) => {
+      const key = normalizeOrderRef(o.id);
+      if (notifiedOrderIds.has(key)) return false;
+      return (!prevReadyKeys.has(key) && (hadPriorOrders || isRealtimeSync)) || isRealtimeSync;
+    });
+
+    if (newlyReady) {
+      notifyStudentOrderReady(newlyReady);
+    }
+  } else {
+    // Allow celebration again when returning if order transitions back from non-READY
+    const activeReadyKeys = new Set(readyStudentOrders.map((o) => normalizeOrderRef(o.id)));
+    for (const key of Array.from(notifiedOrderIds)) {
+      if (!activeReadyKeys.has(key)) notifiedOrderIds.delete(key);
     }
   }
 
   ensureValidSelectedSlot();
   renderApp();
+  syncStudentOrderHeartbeat();
+}
+
+function syncStudentOrderHeartbeat() {
+  const activeOrders = state.orders.filter(
+    (o) =>
+      o.studentId === CURRENT_STUDENT_ID &&
+      o.status !== 'COLLECTED' &&
+      o.status !== 'CANCELLED'
+  );
+  const needsPoll = state.route === 'student' && activeOrders.length > 0;
+
+  if (!needsPoll) {
+    if (heartbeatTimerId !== null) {
+      window.clearInterval(heartbeatTimerId);
+      heartbeatTimerId = null;
+    }
+    return;
+  }
+
+  if (heartbeatTimerId !== null) return;
+
+  // Bulletproof 1.5s fallback poller so Student View updates even if a tab backgrounded or storage event dropped
+  heartbeatTimerId = window.setInterval(async () => {
+    if (isHeartbeatPolling || state.route !== 'student') return;
+    const watchedOrders = state.orders.filter(
+      (o) =>
+        o.studentId === CURRENT_STUDENT_ID &&
+        o.status !== 'COLLECTED' &&
+        o.status !== 'CANCELLED'
+    );
+    if (watchedOrders.length === 0) return;
+
+    isHeartbeatPolling = true;
+    try {
+      const targetOrder = watchedOrders.find((o) => o.status !== 'READY') || watchedOrders[0];
+      const latest = await apiClient.getOrderById(targetOrder.id);
+      if (!latest || latest.status !== targetOrder.status) {
+        await syncAllData({ type: 'HEARTBEAT_SYNC' });
+      }
+    } catch {
+      // Non-fatal fallback poll
+    } finally {
+      isHeartbeatPolling = false;
+    }
+  }, 1500);
 }
 
 function renderApp() {
@@ -357,6 +563,7 @@ function renderApp() {
     </main>
     ${state.route === 'student' ? renderCartDrawer(state) : ''}
     ${state.route === 'student' ? renderDishDetailModal(state) : ''}
+    ${state.route === 'student' ? renderTableAvailabilityModal(state) : ''}
   `;
 }
 
@@ -428,11 +635,12 @@ document.addEventListener('click', async (event) => {
       state.kdsBatchSlot = '12:30';
       state.selectedSlotId = '12:30';
       state.slotSuggestion = null;
+      enforceDurationForSlot('12:30');
       await syncAllData();
       triggerSlotFlash('12:30');
       showToast(
         'Demo Mode: 12:30 Filled to 9/10',
-        'Slot 12:30 is now Amber (Filling Fast). Place 1 order to hit 10/10 & lock!',
+        'Slot 12:30 is now Amber (Filling Fast • 15m Peak Cap active). Place 1 order to lock at 10/10!',
         'warning',
         5000
       );
@@ -446,8 +654,12 @@ document.addEventListener('click', async (event) => {
       state.nlpFeedback = null;
       state.slotSuggestion = null;
       state.dismissedReadyIds = [];
+      notifiedOrderIds.clear();
       state.kdsBatchSlot = 'all';
       state.selectedSlotId = '12:30';
+      state.selectedTableNumber = null;
+      state.userExplicitDuration = false;
+      state.selectedDurationMins = 15;
       await syncAllData();
       showToast('Demo Dataset Reset', 'Restored clean initial campus canteen data.', 'info');
       break;
@@ -521,6 +733,7 @@ document.addEventListener('click', async (event) => {
         state.orderType = nextMode;
         state.slotSuggestion = null;
         ensureValidSelectedSlot();
+        enforceDurationForSlot(state.selectedSlotId);
         renderApp();
       }
       break;
@@ -529,7 +742,120 @@ document.addEventListener('click', async (event) => {
     case 'select-slot': {
       const slotId = actionEl.dataset.slotId;
       trySelectSlot(slotId, state.orderType);
+      ensureValidSelectedTable();
+      enforceDurationForSlot(state.selectedSlotId);
       renderApp();
+      break;
+    }
+
+    case 'select-duration': {
+      const mins = Number(actionEl.dataset.durationMins);
+      if (!mins || actionEl.disabled) break;
+      if (isPeakSlot(state.selectedSlotId, state.slots) && mins > PEAK_MAX_DURATION_MINS) {
+        state.selectedDurationMins = PEAK_MAX_DURATION_MINS;
+        showToast(
+          'Peak Hour Duration Limit',
+          'Adjusted table duration to 15 mins (Peak Hour Limit).',
+          'warning',
+          3800
+        );
+        renderApp();
+        break;
+      }
+      state.selectedDurationMins = mins;
+      state.userExplicitDuration = true;
+      state.orderType = 'dine-in';
+
+      if (state.selectedTableNumber) {
+        const avail = computeTablesAvailability(
+          state.orders,
+          CANTEEN_TABLES,
+          state.selectedSlotId,
+          mins
+        );
+        const tblEntry = avail.find((t) => t.number === Number(state.selectedTableNumber));
+        if (tblEntry?.hasConflict) {
+          state.selectedTableNumber = null;
+          showToast(
+            'Table Cleared for Extended Stay',
+            `Previous table is booked at ${tblEntry.conflictAt}. Pick an open table or auto-assign.`,
+            'warning'
+          );
+        }
+      }
+      renderApp();
+      break;
+    }
+
+    case 'open-table-map': {
+      state.isTableMapOpen = true;
+      ensureValidSelectedTable();
+      ensureValidDurationForSelectedTable();
+      renderApp();
+      break;
+    }
+
+    case 'close-table-map': {
+      state.isTableMapOpen = false;
+      renderApp();
+      break;
+    }
+
+    case 'confirm-table-map': {
+      state.isTableMapOpen = false;
+      if (state.cart.length > 0 && state.selectedTableNumber) {
+        state.isCartOpen = true;
+      }
+      renderApp();
+      break;
+    }
+
+    case 'select-slot-in-map': {
+      const slotId = actionEl.dataset.slotId;
+      state.selectedSlotId = slotId;
+      state.slotSuggestion = null;
+      ensureValidSelectedTable();
+      enforceDurationForSlot(slotId);
+      renderApp();
+      break;
+    }
+
+    case 'select-table': {
+      const tableNum = Number(actionEl.dataset.tableNumber);
+      const avail = computeTablesAvailability(
+        state.orders,
+        CANTEEN_TABLES,
+        state.selectedSlotId,
+        state.selectedDurationMins
+      );
+      const tblInfo = avail.find((t) => t.number === tableNum);
+      if (!tableNum || !tblInfo || tblInfo.isBooked) break;
+
+      state.selectedTableNumber = tableNum;
+      state.orderType = 'dine-in';
+
+      if (tblInfo.hasConflict && tblInfo.maxAllowedDurationMins >= 15) {
+        const adjusted = [60, 45, 30, 15].find((d) => d <= tblInfo.maxAllowedDurationMins) || 15;
+        state.selectedDurationMins = adjusted;
+        const adjustedRange = formatTimeRange(state.selectedSlotId, adjusted);
+        renderApp();
+        showToast(
+          `Reserved ${tblInfo.id} • Capped to ${adjusted} mins`,
+          `Next slot booked at ${tblInfo.conflictAt} — window set to ${adjustedRange.compactRange}.`,
+          'warning',
+          3600
+        );
+        break;
+      }
+
+      const rangeInfo = formatTimeRange(state.selectedSlotId, state.selectedDurationMins);
+      renderApp();
+      showToast(
+        `Reserved ${tblInfo.id} (${tblInfo.label})`,
+        `${rangeInfo.compactRange} (${state.selectedDurationMins} mins) Dine-In.`,
+        'success',
+        2600
+      );
       break;
     }
 
@@ -539,25 +865,38 @@ document.addEventListener('click', async (event) => {
       renderApp();
 
       try {
-        const order = await apiClient.createOrder({
+        const chosenNum = state.orderType === 'dine-in' ? state.selectedTableNumber : null;
+        const chosenDur = state.orderType === 'dine-in' ? state.selectedDurationMins : null;
+        const order = await apiClient.bookSlotAndOrder({
           studentId: CURRENT_STUDENT_ID,
           studentName: state.studentName.trim() || CURRENT_STUDENT_NAME,
           slotId: state.selectedSlotId,
           orderType: state.orderType,
+          durationMins: chosenDur,
+          tableNumber: chosenNum,
+          tableId: chosenNum ? `T${chosenNum}` : null,
           items: state.cart.map((c) => ({ itemId: c.itemId, qty: c.qty }))
         });
 
         state.cart = [];
         state.isCartOpen = false;
+        state.selectedTableNumber = null;
+        state.userExplicitDuration = false;
+        enforceDurationForSlot(state.selectedSlotId);
         state.nlpFeedback = null;
         state.slotSuggestion = null;
         await syncAllData();
 
+        const rangeText =
+          order.orderType === 'dine-in'
+            ? `Table T${order.tableNumber} • ${
+                formatTimeRange(order.slotId, order.durationMins || 30).compactRange
+              } (${order.durationMins || 30}m)`
+            : `${order.slotId} Takeaway`;
+
         showToast(
           `Order Confirmed • #${order.token}`,
-          `Booked ${order.slotId} (${
-            order.orderType === 'dine-in' ? `Table #${order.tableNumber}` : 'Takeaway'
-          }).`,
+          `Booked ${rangeText}.`,
           'success',
           4600
         );
@@ -567,7 +906,16 @@ document.addEventListener('click', async (event) => {
           block: 'nearest'
         });
       } catch (err) {
-        if (err.code === 'SLOT_FULL' || err.code === 'TABLES_FULL') {
+        if (err.code === 'TABLE_TAKEN' || err.code === 'TABLE_DURATION_CONFLICT') {
+          state.selectedTableNumber = null;
+          state.isTableMapOpen = true;
+          await syncAllData();
+          showToast(
+            err.code === 'TABLE_DURATION_CONFLICT' ? 'Time Window Conflict' : 'Table Just Booked',
+            err.message,
+            'warning'
+          );
+        } else if (err.code === 'SLOT_FULL' || err.code === 'TABLES_FULL') {
           trySelectSlot(state.selectedSlotId, state.orderType);
         } else {
           showToast('Order Failed', err.message, 'error');
@@ -656,6 +1004,31 @@ document.addEventListener('click', async (event) => {
       break;
     }
 
+    case 'set-manager-tab': {
+      state.managerTab = actionEl.dataset.tab || 'all';
+      renderApp();
+      break;
+    }
+
+    case 'apply-smart-rec': {
+      const rec = {
+        id: actionEl.dataset.recId,
+        title: actionEl.dataset.recTitle,
+        itemName: actionEl.dataset.itemName,
+        deltaQty: Number(actionEl.dataset.deltaQty) || 12,
+        slotId: actionEl.dataset.slotId || '12:30',
+        note: actionEl.dataset.recNote
+      };
+      const applied = await apiClient.applyPrepRecommendation(rec);
+      await syncAllData();
+      showToast(
+        'Smart Batch Prep Applied',
+        `${applied.deltaQty > 0 ? '+' : ''}${applied.deltaQty}× ${applied.itemName} pushed to Kitchen KDS (${applied.slotId}).`,
+        'success'
+      );
+      break;
+    }
+
     default:
       break;
   }
@@ -688,9 +1061,11 @@ document.addEventListener('change', (event) => {
   if (action === 'change-order-type-select') {
     state.orderType = event.target.value;
     ensureValidSelectedSlot();
+    enforceDurationForSlot(state.selectedSlotId);
     renderApp();
   } else if (action === 'change-slot-select') {
     trySelectSlot(event.target.value, state.orderType);
+    enforceDurationForSlot(state.selectedSlotId);
     renderApp();
   }
 });
@@ -748,7 +1123,10 @@ document.addEventListener('submit', async (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
-    if (state.activeDishModalId) {
+    if (state.isTableMapOpen) {
+      state.isTableMapOpen = false;
+      renderApp();
+    } else if (state.activeDishModalId) {
       state.activeDishModalId = null;
       renderApp();
     } else if (state.isCartOpen) {
@@ -762,10 +1140,11 @@ window.addEventListener('hashchange', () => {
   state.route = resolveRouteFromHash();
   if (state.route === 'staff' && state.staffSession) {
     setApiUserRole(state.staffSession.role);
+    renderApp();
   } else {
     setApiUserRole('student');
+    syncAllData({ type: 'ROUTE_RETURN' });
   }
-  renderApp();
 });
 
 /* ==========================================================================
@@ -773,6 +1152,12 @@ window.addEventListener('hashchange', () => {
    ========================================================================== */
 
 (async function init() {
+  if (window.location.hostname === 'localhost') {
+    console.info(
+      '[CampusBite Sync] Running on localhost — keep both Student and #staff tabs on the exact same host (127.0.0.1:8080 or localhost:8080) so localStorage & BroadcastChannel stay shared.'
+    );
+  }
+
   if (state.route === 'staff' && state.staffSession) {
     setApiUserRole(state.staffSession.role);
   } else {
@@ -782,4 +1167,22 @@ window.addEventListener('hashchange', () => {
   apiClient.subscribeToUpdates((evt) => {
     syncAllData(evt);
   });
+  apiClient.subscribeToOrderUpdates(null, (order, meta) => {
+    if (order.studentId === CURRENT_STUDENT_ID && order.status === 'READY') {
+      syncAllData(meta);
+    }
+  });
+
+  // Live 1-second countdown tick for seated Dine-In Student Active Pass
+  window.setInterval(() => {
+    const countdownEls = document.querySelectorAll('[data-countdown-order-id]');
+    if (!countdownEls.length) return;
+    const now = Date.now();
+    for (const el of countdownEls) {
+      const ordId = el.dataset.countdownOrderId;
+      const ord = state.orders.find((o) => o.id === ordId);
+      if (!ord || ord.status !== 'READY') continue;
+      el.textContent = `⏱ ${formatLiveTableCountdown(ord, now)}`;
+    }
+  }, 1000);
 })();

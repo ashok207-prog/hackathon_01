@@ -4,10 +4,14 @@ import { renderTokenQR } from '../utils/qrGenerator.js';
 import { parsePlainLanguageOrder } from '../utils/nlpOrderParser.js';
 import {
   escapeHtml,
+  formatLiveTableCountdown,
   formatRupees,
-  getSlotStatusColor
+  formatTimeRange,
+  getSlotStatusColor,
+  isPeakSlot
 } from '../utils/format.js';
-import { CURRENT_STUDENT_ID } from '../data/mockSeed.js';
+import { renderDurationSelector } from '../components/DurationSelector.js';
+import { CURRENT_STUDENT_ID, CANTEEN_TABLES } from '../data/mockSeed.js';
 
 const EXAMPLE_PROMPTS = [
   '2 masala dosa and 1 cold coffee for 12:30 dine-in',
@@ -17,7 +21,7 @@ const EXAMPLE_PROMPTS = [
 export function renderNlpLivePreview(nlpQuery, menu, slots) {
   const slotIds = slots.map((s) => s.id);
   const liveParsed = nlpQuery.trim()
-    ? parsePlainLanguageOrder(nlpQuery, menu, slotIds)
+    ? parsePlainLanguageOrder(nlpQuery, menu, slotIds, slots)
     : null;
 
   if (!liveParsed) return '';
@@ -46,6 +50,11 @@ export function renderNlpLivePreview(nlpQuery, menu, slots) {
           ? `<span class="parse-tag mode">${
               liveParsed.orderType === 'dine-in' ? 'Dine-In' : 'Takeaway'
             }</span>`
+          : ''
+      }
+      ${
+        liveParsed.durationMins
+          ? `<span class="parse-tag slot">${icon('clock', 12)} ${liveParsed.durationMins} mins</span>`
           : ''
       }
       ${
@@ -144,6 +153,10 @@ function renderMenuSection(state) {
     if (menuFilter === 'veg') return item.isVeg;
     if (menuFilter === 'non-veg') return !item.isVeg;
     if (menuFilter === 'new') return item.isNew;
+    if (menuFilter === 'snacks') return item.category === 'Snacks' || item.category === 'Quick Bites';
+    if (menuFilter === 'burgers') return item.category === 'Burgers';
+    if (menuFilter === 'beverages') return item.category === 'Beverages';
+    if (menuFilter === 'desserts') return item.category === 'Desserts';
     return true;
   });
 
@@ -189,6 +202,38 @@ function renderMenuSection(state) {
             <span>New Updates</span>
             ${newCount > 0 ? `<span class="role-badge">${newCount}</span>` : ''}
           </button>
+          <button
+            type="button"
+            class="filter-pill ${menuFilter === 'snacks' ? 'active' : ''}"
+            data-action="set-menu-filter"
+            data-filter="snacks"
+          >
+            <span>🍟 Snacks</span>
+          </button>
+          <button
+            type="button"
+            class="filter-pill ${menuFilter === 'burgers' ? 'active' : ''}"
+            data-action="set-menu-filter"
+            data-filter="burgers"
+          >
+            <span>🍔 Burgers</span>
+          </button>
+          <button
+            type="button"
+            class="filter-pill ${menuFilter === 'beverages' ? 'active' : ''}"
+            data-action="set-menu-filter"
+            data-filter="beverages"
+          >
+            <span>🥤 Beverages</span>
+          </button>
+          <button
+            type="button"
+            class="filter-pill ${menuFilter === 'desserts' ? 'active' : ''}"
+            data-action="set-menu-filter"
+            data-filter="desserts"
+          >
+            <span>🍨 Ice Cream</span>
+          </button>
         </div>
       </div>
 
@@ -224,7 +269,7 @@ function renderMenuSection(state) {
                   data-item-id="${escapeHtml(dish.id)}"
                   title="View full nutrition & details"
                 >
-                  ${getDishArt(dish.artKey, dish.isVeg, dish.name)}
+                  ${getDishArt(dish.artKey, dish.isVeg, dish.name, dish.image)}
                   <span class="rating-pill">
                     <span>${dish.rating.toFixed(1)}</span>
                     <span class="star">★</span>
@@ -244,7 +289,7 @@ function renderMenuSection(state) {
                   data-action="open-dish-modal"
                   data-item-id="${escapeHtml(dish.id)}"
                 >
-                  ${dish.calories} kcal • ${dish.protein}g protein
+                  ${escapeHtml(dish.nutritionBadge || `${dish.calories} kcal • ${dish.protein}g protein`)}
                 </button>
 
                 <div class="menu-card-footer">
@@ -286,7 +331,10 @@ function renderMenuSection(state) {
 function renderSlotSelectorPanel(state) {
   const {
     slots,
+    orders = [],
     selectedSlotId,
+    selectedTableNumber,
+    selectedDurationMins = 30,
     orderType,
     slotSuggestion,
     flashSlotId,
@@ -294,6 +342,19 @@ function renderSlotSelectorPanel(state) {
     cart,
     menu
   } = state;
+
+  const activeSlotObj = slots.find((s) => s.id === selectedSlotId);
+  const freeTablesCount = activeSlotObj
+    ? Math.max(
+        0,
+        activeSlotObj.maxDineInTables -
+          (activeSlotObj.bookedTableNumbers?.length ?? activeSlotObj.dineInTablesCount)
+      )
+    : 10;
+  const chosenTableObj =
+    orderType === 'dine-in' && selectedTableNumber
+      ? CANTEEN_TABLES.find((t) => t.number === Number(selectedTableNumber))
+      : null;
 
   const cartQty = cart.reduce((s, l) => s + l.qty, 0);
   const cartTotal = cart.reduce((s, l) => {
@@ -382,10 +443,15 @@ function renderSlotSelectorPanel(state) {
               </div>
 
               <div class="slot-sub-meta">
-                ${capWord} • ${
+                <span>${capWord} • ${
                   orderType === 'dine-in'
                     ? `Tables ${slot.dineInTablesCount}/10`
                     : `${10 - effectiveCount} left`
+                }</span>
+                ${
+                  isPeakSlot(slot, slots)
+                    ? `<span class="peak-cap-badge">⚡ Peak (15m Cap)</span>`
+                    : ''
                 }
               </div>
             </button>
@@ -393,6 +459,42 @@ function renderSlotSelectorPanel(state) {
           })
           .join('')}
       </div>
+
+      <button
+        type="button"
+        class="btn-table-map-trigger"
+        data-action="open-table-map"
+      >
+        <span>${icon('table', 14)} Check Table Availability</span>
+        <span class="table-trigger-badge">${freeTablesCount}/10 Free</span>
+      </button>
+
+      ${
+        orderType === 'dine-in'
+          ? renderDurationSelector({
+              slots,
+              orders,
+              selectedSlotId,
+              selectedDurationMins,
+              selectedTableNumber
+            })
+          : ''
+      }
+
+      ${
+        chosenTableObj
+          ? `
+        <div class="selected-table-chip">
+          <span>${icon('checkCircle', 14)} Reserved: <strong>${escapeHtml(
+              chosenTableObj.id
+            )} (${escapeHtml(chosenTableObj.label)})</strong> • ${escapeHtml(
+              formatTimeRange(selectedSlotId, selectedDurationMins).compactRange
+            )} (${selectedDurationMins}m)</span>
+          <button type="button" class="chip-change-btn" data-action="open-table-map">Change</button>
+        </div>
+      `
+          : ''
+      }
 
       ${
         cartQty > 0
@@ -430,18 +532,28 @@ function renderLiveOrderTracker(state) {
     `;
   }
 
-  const order = myOrders[0];
+  // Prioritize any order that is READY so its token, QR & 100% emerald progress spotlight immediately
+  const order = myOrders.find((o) => o.status === 'READY') || myOrders[0];
   const stepIndex = order.status === 'READY' ? 2 : order.status === 'PREPARING' ? 1 : 0;
   const isReady = order.status === 'READY';
   const itemsSummary = order.items.map((i) => `${i.qty}× ${i.name}`).join(', ');
+  const dineInDuration = Math.max(10, Number(order.durationMins) || 30);
+  const dineInRange =
+    order.orderType === 'dine-in'
+      ? formatTimeRange(order.slotId, dineInDuration)
+      : null;
 
   return `
-    <section id="live-order-tracker">
+    <section
+      id="live-order-tracker"
+      data-active-order-id="${escapeHtml(order.id)}"
+      data-active-token="${escapeHtml(order.token)}"
+    >
       <div class="live-order-card ${isReady ? 'is-ready' : ''}">
         <div class="panel-title-row" style="margin-bottom:0;">
           <h3>${isReady ? 'Ready for Pickup!' : 'Active Order'}</h3>
-          <span class="slot-status-pill ${isReady ? 'green' : 'amber'}">
-            ${isReady ? 'Ready' : order.status === 'PREPARING' ? 'Preparing' : 'Placed'}
+          <span class="slot-status-pill ${isReady ? 'green is-ready-pill' : 'amber'}">
+            ${isReady ? 'READY' : order.status === 'PREPARING' ? 'Preparing' : 'Placed'}
           </span>
         </div>
 
@@ -453,10 +565,21 @@ function renderLiveOrderTracker(state) {
               <span class="mini-tag ${order.orderType === 'dine-in' ? 'dine-in' : 'takeaway'}">
                 ${
                   order.orderType === 'dine-in'
-                    ? `Dine-In • T${order.tableNumber || 1}`
+                    ? `Table T${order.tableNumber || 1} • ${escapeHtml(
+                        dineInRange.compactRange
+                      )} (${dineInDuration}m)`
                     : 'Takeaway'
                 }
               </span>
+              ${
+                order.orderType === 'dine-in'
+                  ? `<span class="table-countdown-pill ${
+                      isReady ? 'is-live' : ''
+                    }" data-countdown-order-id="${escapeHtml(order.id)}">${
+                      isReady ? '⏱ ' : ''
+                    }${escapeHtml(formatLiveTableCountdown(order))}</span>`
+                  : ''
+              }
             </div>
           </div>
           <div class="qr-box">${renderTokenQR(`${order.id}-${order.token}`)}</div>

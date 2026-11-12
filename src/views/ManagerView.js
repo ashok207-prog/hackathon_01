@@ -1,6 +1,15 @@
 import { icon } from '../utils/icons.js';
 import { getDishArt } from '../utils/foodArt.js';
-import { escapeHtml, formatRupees, getSlotStatusColor } from '../utils/format.js';
+import {
+  computeTablesAvailability,
+  escapeHtml,
+  formatRupees,
+  formatTimeRange,
+  getSlotStatusColor,
+  isPeakSlot
+} from '../utils/format.js';
+import { CANTEEN_TABLES } from '../data/mockSeed.js';
+import { renderManagerAnalytics } from '../components/ManagerAnalytics.js';
 
 function renderManagerSlotBoard(slots, orders) {
   const validOrders = orders.filter((o) => o.status !== 'CANCELLED');
@@ -52,22 +61,39 @@ function renderManagerSlotBoard(slots, orders) {
                 ? 'Filling Fast'
                 : 'Open';
 
-            // Build 10-table visual occupancy map (T1..T10) combining explicit table numbers & simulated count
+            // Build 10-table visual occupancy map (T1..T10) accounting for multi-slot durations
+            const tableAvailability = computeTablesAvailability(
+              validOrders,
+              CANTEEN_TABLES,
+              slot.id,
+              10
+            );
             const explicitTables = new Set(
-              slotOrders
-                .filter((o) => o.orderType === 'dine-in' && o.tableNumber)
-                .map((o) => Number(o.tableNumber))
+              tableAvailability.filter((t) => t.isBooked).map((t) => t.number)
             );
             for (let n = 1; n <= slot.maxDineInTables && explicitTables.size < slot.dineInTablesCount; n += 1) {
               explicitTables.add(n);
             }
+
+            // Include carry-over Dine-In bookings occupying a table in this slot from an earlier window
+            const carryOverOrders = tableAvailability
+              .map((t) => t.occupyingOrder)
+              .filter((ord) => ord && ord.slotId !== slot.id);
+            const rosterOrders = [...slotOrders, ...carryOverOrders];
 
             return `
               <article class="manager-slot-card ${
                 slot.isFoodFull || slot.isTablesFull ? 'is-full' : ''
               }">
                 <div class="manager-slot-head">
-                  <span class="manager-slot-time">${escapeHtml(slot.id)}</span>
+                  <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;">
+                    <span class="manager-slot-time">${escapeHtml(slot.id)}</span>
+                    ${
+                      isPeakSlot(slot, slots)
+                        ? `<span class="peak-cap-badge">⚡ Peak (15m Cap)</span>`
+                        : ''
+                    }
+                  </div>
                   <span class="slot-status-pill ${overallColor}">${statusText}</span>
                 </div>
 
@@ -98,32 +124,47 @@ function renderManagerSlotBoard(slots, orders) {
                   <div class="table-mini-grid">
                     ${Array.from({ length: slot.maxDineInTables }, (_, idx) => {
                       const tNum = idx + 1;
+                      const tblInfo = tableAvailability.find((t) => t.number === tNum);
                       const isBooked = explicitTables.has(tNum);
+                      const dur = tblInfo?.occupyingOrder?.durationMins || 30;
+                      const tip = isBooked
+                        ? `Table ${tNum}: Reserved ${tblInfo?.bookedRange || slot.id} (${dur}m)${
+                            tblInfo?.occupyingOrder ? ` • #${tblInfo.occupyingOrder.token}` : ''
+                          }`
+                        : `Table ${tNum}: Available`;
                       return `<span class="table-chip ${
                         isBooked ? 'booked' : 'open'
-                      }" title="Table ${tNum}: ${isBooked ? 'Reserved' : 'Available'}">T${tNum}</span>`;
+                      }" title="${escapeHtml(tip)}">T${tNum}${
+                        isBooked && tblInfo?.bookedRange ? ` · ${dur}m` : ''
+                      }</span>`;
                     }).join('')}
                   </div>
                 </div>
 
                 <div class="manager-slot-orders">
-                  <div class="table-map-label">Booked Tokens (${slotOrders.length})</div>
+                  <div class="table-map-label">Booked Tokens (${rosterOrders.length})</div>
                   ${
-                    slotOrders.length === 0
+                    rosterOrders.length === 0
                       ? `<div class="manager-slot-empty">No direct order tickets yet</div>`
                       : `
                         <ul class="manager-token-list">
-                          ${slotOrders
-                            .map(
-                              (ord) => `
+                          ${rosterOrders
+                            .map((ord) => {
+                              const isCarryOver = ord.slotId !== slot.id;
+                              const dineDur = Number(ord.durationMins) || 30;
+                              const rangeLabel =
+                                ord.orderType === 'dine-in'
+                                  ? `${formatTimeRange(ord.slotId, dineDur).compactRange} • ${dineDur}m`
+                                  : 'Takeaway';
+                              return `
                             <li>
                               <span class="manager-tok-id">#${escapeHtml(ord.token)}</span>
                               <span class="manager-tok-meta">
                                 ${escapeHtml(ord.studentName.split('•')[0].trim())} • ${
                                 ord.orderType === 'dine-in'
-                                  ? `T${ord.tableNumber || 1}`
+                                  ? `T${ord.tableNumber || 1} (${escapeHtml(rangeLabel)})`
                                   : 'Takeaway'
-                              }
+                              }${isCarryOver ? ' <em>hold</em>' : ''}
                               </span>
                               <span class="mini-tag ${
                                 ord.status === 'READY' || ord.status === 'COLLECTED'
@@ -131,8 +172,8 @@ function renderManagerSlotBoard(slots, orders) {
                                   : 'dine-in'
                               }">${escapeHtml(ord.status)}</span>
                             </li>
-                          `
-                            )
+                          `;
+                            })
                             .join('')}
                         </ul>
                       `
@@ -148,7 +189,7 @@ function renderManagerSlotBoard(slots, orders) {
 }
 
 export function renderManagerView(state) {
-  const { menu, orders, slots } = state;
+  const { menu, orders, slots, managerTab = 'all' } = state;
 
   const validOrders = orders.filter((o) => o.status !== 'CANCELLED');
   const totalOrdersToday = validOrders.length;
@@ -160,8 +201,50 @@ export function renderManagerView(state) {
   ).length;
   const maxTablesTotal = slots.reduce((s, slot) => s + slot.maxDineInTables, 0);
 
+  const showOperations = managerTab === 'all' || managerTab === 'operations';
+  const showAnalytics = managerTab === 'all' || managerTab === 'analytics';
+
   return `
     <div class="manager-container view-enter">
+      <div class="manager-subnav-bar" role="tablist" aria-label="Canteen Manager Sections">
+        <div class="manager-subnav-pills">
+          <button
+            type="button"
+            class="manager-subnav-btn ${managerTab === 'all' ? 'active' : ''}"
+            data-action="set-manager-tab"
+            data-tab="all"
+            role="tab"
+            aria-selected="${managerTab === 'all'}"
+          >
+            ${icon('sliders', 15)} All Overview
+          </button>
+          <button
+            type="button"
+            class="manager-subnav-btn ${managerTab === 'operations' ? 'active' : ''}"
+            data-action="set-manager-tab"
+            data-tab="operations"
+            role="tab"
+            aria-selected="${managerTab === 'operations'}"
+          >
+            ${icon('clock', 15)} Operations &amp; Slots
+          </button>
+          <button
+            type="button"
+            class="manager-subnav-btn ${managerTab === 'analytics' ? 'active' : ''}"
+            data-action="set-manager-tab"
+            data-tab="analytics"
+            role="tab"
+            aria-selected="${managerTab === 'analytics'}"
+          >
+            ${icon('trending', 15)} Order Insights &amp; Analytics
+          </button>
+        </div>
+        <span class="manager-subnav-meta">Canteen Manager Command Center</span>
+      </div>
+
+      ${
+        showOperations
+          ? `
       <section class="kpi-strip" aria-label="Live Canteen KPIs">
         <div class="kpi-card">
           <div>
@@ -223,7 +306,7 @@ export function renderManagerView(state) {
                   <tr>
                     <td>
                       <div class="stock-dish-cell">
-                        <div class="stock-thumb">${getDishArt(item.artKey, item.isVeg, item.name)}</div>
+                        <div class="stock-thumb">${getDishArt(item.artKey, item.isVeg, item.name, item.image)}</div>
                         <div>
                           <div style="display:flex;align-items:center;gap:6px;font-weight:700;color:var(--text-primary);">
                             <span class="diet-indicator ${item.isVeg ? 'veg' : 'non-veg'}"></span>
@@ -364,6 +447,11 @@ export function renderManagerView(state) {
           </form>
         </section>
       </div>
+      `
+          : ''
+      }
+
+      ${showAnalytics ? renderManagerAnalytics(state) : ''}
     </div>
   `;
 }

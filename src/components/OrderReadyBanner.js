@@ -19,8 +19,8 @@ export function renderOrderReadyBanner(state) {
   const itemSummary = order.items.map((i) => `${i.qty}x ${i.name}`).join(', ');
   const pickupLocation =
     order.orderType === 'dine-in'
-      ? `Dine-In • Table #${order.tableNumber || 1}`
-      : 'Takeaway Pickup Counter';
+      ? `Table T${order.tableNumber || 1}`
+      : 'Takeaway Counter';
 
   return `
     <div class="ready-banner-wrap" role="status" aria-live="polite">
@@ -29,12 +29,11 @@ export function renderOrderReadyBanner(state) {
           <div class="ready-icon-circle">${icon('bell', 20)}</div>
           <div>
             <div class="ready-banner-title">
-              <span>Order Ready!</span>
-              <span class="ready-token-pill">#${escapeHtml(order.token)}</span>
-              <span>• ${escapeHtml(order.slotId)} (${escapeHtml(pickupLocation)})</span>
+              <span>🎉 Order #${escapeHtml(order.token)} is Ready!</span>
+              <span class="ready-token-pill">READY</span>
             </div>
             <div class="ready-banner-sub">
-              ${escapeHtml(itemSummary)} — Show your QR token at the counter.
+              Please collect it at <strong>${escapeHtml(pickupLocation)}</strong> (${escapeHtml(order.slotId)} • ${escapeHtml(itemSummary)}).
             </div>
           </div>
         </div>
@@ -48,7 +47,7 @@ export function renderOrderReadyBanner(state) {
             data-action="dismiss-ready-banner"
             data-order-id="${escapeHtml(order.id)}"
           >
-            Dismiss
+            Got It / Dismiss
           </button>
         </div>
       </div>

@@ -10,8 +10,15 @@ import {
   INITIAL_MENU,
   INITIAL_SLOTS_META,
   INITIAL_ORDERS,
+  CANTEEN_TABLES,
   buildDemoFillOrdersFor1230
 } from '../data/mockSeed.js';
+import {
+  PEAK_MAX_DURATION_MINS,
+  computeTablesAvailability,
+  formatTimeRange,
+  isPeakSlot
+} from '../utils/format.js';
 
 const USE_MOCK_API = true;
 
@@ -20,7 +27,27 @@ const WS_BASE_URL = 'ws://localhost:5000/ws/updates';
 const STORAGE_KEY = 'campusbite_mock_db_v1';
 const STAFF_SESSION_KEY = 'campusbite_staff_session_v1';
 const UPDATE_EVENT = 'campusbite:db-update';
+const REALTIME_CHANNEL = 'campusbite_live_sync';
 const DEMO_STAFF_PIN = '1234';
+
+/**
+ * Normalizes order references across IDs and `#`-prefixed tokens (e.g. `#7655` -> `7655`).
+ */
+export function normalizeOrderRef(ref) {
+  return String(ref ?? '')
+    .replace(/^#/, '')
+    .trim()
+    .toLowerCase();
+}
+
+export function matchesOrderRef(order, ref) {
+  if (!order || ref == null || ref === '') return false;
+  const needle = normalizeOrderRef(ref);
+  return (
+    normalizeOrderRef(order.id) === needle ||
+    normalizeOrderRef(order.token) === needle
+  );
+}
 
 let activeRole = 'student'; // 'student' | 'kitchen' | 'manager'
 
@@ -134,6 +161,49 @@ function loadMockDb() {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && Array.isArray(parsed.menu) && Array.isArray(parsed.orders)) {
+        if (!Array.isArray(parsed.prepAdjustments)) {
+          parsed.prepAdjustments = [];
+        }
+        // Automatically merge newly seeded catalog items into stale localStorage caches
+        const existingIds = new Set(parsed.menu.map((item) => item.id));
+        const missingSeedItems = INITIAL_MENU.filter((item) => !existingIds.has(item.id));
+        let didMigrate = false;
+
+        if (missingSeedItems.length > 0) {
+          parsed.menu = [...parsed.menu, ...clone(missingSeedItems)];
+          didMigrate = true;
+        }
+
+        // Sync Loaded Cheese Fries aliases & ensure every seeded item has a real food photo URL (replacing stale SVG caches)
+        const seedById = new Map(INITIAL_MENU.map((item) => [item.id, item]));
+        parsed.menu = parsed.menu.map((item) => {
+          const seedItem = seedById.get(item.id);
+          if (!seedItem) return item;
+
+          let updated = item;
+          const imgVal = typeof item.image === 'string' ? item.image.trim() : '';
+          const hasStaleOrSvgImage =
+            !imgVal ||
+            imgVal.includes('<svg') ||
+            imgVal.toLowerCase().includes('.svg') ||
+            imgVal.startsWith('data:image/svg') ||
+            imgVal !== seedItem.image;
+
+          if (hasStaleOrSvgImage && seedItem.image) {
+            updated = { ...updated, image: seedItem.image };
+            didMigrate = true;
+          }
+
+          if (item.id === 'item-fries' && Array.isArray(item.aliases) && item.aliases.includes('fries')) {
+            updated = { ...updated, aliases: clone(seedItem.aliases) };
+            didMigrate = true;
+          }
+          return updated;
+        });
+
+        if (didMigrate) {
+          saveMockDb(parsed, false);
+        }
         return parsed;
       }
     }
@@ -144,10 +214,24 @@ function loadMockDb() {
   const seeded = {
     menu: clone(INITIAL_MENU),
     slotsMeta: clone(INITIAL_SLOTS_META),
-    orders: clone(INITIAL_ORDERS)
+    orders: clone(INITIAL_ORDERS),
+    prepAdjustments: []
   };
   saveMockDb(seeded, false);
   return seeded;
+}
+
+function broadcastLiveSync(message) {
+  if (typeof window === 'undefined') return;
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel(REALTIME_CHANNEL);
+      ch.postMessage({ timestamp: Date.now(), ...message });
+      ch.close();
+    }
+  } catch {
+    // BroadcastChannel optional
+  }
 }
 
 function saveMockDb(db, notify = true) {
@@ -157,8 +241,25 @@ function saveMockDb(db, notify = true) {
     // Fallback gracefully if storage quota exceeded
   }
   if (notify && typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent(UPDATE_EVENT, { detail: { timestamp: Date.now() } }));
+    const payload = { timestamp: Date.now() };
+    window.dispatchEvent(new CustomEvent(UPDATE_EVENT, { detail: payload }));
+    broadcastLiveSync({ type: 'CROSS_TAB_SYNC', ...payload });
   }
+}
+
+function getBookedTableSetForSlot(db, slotId) {
+  const availability = computeTablesAvailability(db.orders, CANTEEN_TABLES, slotId, 10);
+  const taken = new Set(availability.filter((t) => t.isBooked).map((t) => t.number));
+
+  const slotDineInCount = db.orders.filter(
+    (ord) => ord.slotId === slotId && ord.status !== 'CANCELLED' && ord.orderType === 'dine-in'
+  ).length;
+
+  // Ensure simulated / unnumbered dine-in bookings also occupy distinct table numbers
+  for (let n = 1; n <= 10 && taken.size < slotDineInCount; n += 1) {
+    taken.add(n);
+  }
+  return taken;
 }
 
 function computeSlotsFromDb(db) {
@@ -167,12 +268,23 @@ function computeSlotsFromDb(db) {
       (ord) => ord.slotId === slot.id && ord.status !== 'CANCELLED'
     );
     const foodOrdersCount = slotOrders.length;
-    const dineInTablesCount = slotOrders.filter((ord) => ord.orderType === 'dine-in').length;
-
-    return {
+    const bookedTableNumbers = Array.from(getBookedTableSetForSlot(db, slot.id)).sort(
+      (a, b) => a - b
+    );
+    const dineInTablesCount = bookedTableNumbers.length;
+    const slotBase = {
       ...slot,
       foodOrdersCount,
-      dineInTablesCount,
+      dineInTablesCount
+    };
+    const peak = isPeakSlot(slotBase);
+
+    return {
+      ...slotBase,
+      isPeak: peak,
+      maxDurationMins: peak ? PEAK_MAX_DURATION_MINS : 60,
+      freeTablesCount: Math.max(0, slot.maxDineInTables - dineInTablesCount),
+      bookedTableNumbers,
       isFoodFull: foodOrdersCount >= slot.maxFoodOrders,
       isTablesFull: dineInTablesCount >= slot.maxDineInTables
     };
@@ -241,6 +353,12 @@ export const apiClient = {
     if (filter === 'veg') items = items.filter((i) => i.isVeg);
     else if (filter === 'non-veg') items = items.filter((i) => !i.isVeg);
     else if (filter === 'new') items = items.filter((i) => i.isNew);
+    else if (filter === 'snacks') {
+      items = items.filter((i) => i.category === 'Snacks' || i.category === 'Quick Bites');
+    } else if (filter === 'burgers') items = items.filter((i) => i.category === 'Burgers');
+    else if (filter === 'beverages') items = items.filter((i) => i.category === 'Beverages');
+    else if (filter === 'desserts') items = items.filter((i) => i.category === 'Desserts');
+    return clone(items);
     return clone(items);
   },
 
@@ -256,6 +374,23 @@ export const apiClient = {
 
     const db = loadMockDb();
     return computeSlotsFromDb(db);
+  },
+
+  /**
+   * Evaluates table availability for a target start slot and dining duration,
+   * accounting for multi-slot overlap locks from earlier and upcoming bookings.
+   * // TODO: Connect Backend Endpoint -> GET /api/tables/availability?slotId=...&durationMins=...
+   */
+  async getAvailableTables(slotId = '12:30', durationMins = 30) {
+    if (!USE_MOCK_API) {
+      // TODO: Connect Backend Endpoint -> return request(`/tables/availability?slotId=${encodeURIComponent(slotId)}&durationMins=${Number(durationMins) || 30}`);
+      return request(
+        `/tables/availability?slotId=${encodeURIComponent(slotId)}&durationMins=${Number(durationMins) || 30}`
+      );
+    }
+
+    const db = loadMockDb();
+    return clone(computeTablesAvailability(db.orders, CANTEEN_TABLES, slotId, durationMins));
   },
 
   /**
@@ -281,6 +416,24 @@ export const apiClient = {
       list = list.filter((o) => o.status === filters.status);
     }
     return clone(list).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  },
+
+  /**
+   * Fetch a single order by `id` or `#token` (used by 1.5s Student heartbeat fallback).
+   * // TODO: Connect Backend Endpoint -> GET /api/orders/:id
+   */
+  async getOrderById(orderRef) {
+    const cleanRef = String(orderRef ?? '').replace(/^#/, '').trim();
+    if (!cleanRef) return null;
+
+    if (!USE_MOCK_API) {
+      // TODO: Connect Backend Endpoint -> return request(`/orders/${encodeURIComponent(cleanRef)}`);
+      return request(`/orders/${encodeURIComponent(cleanRef)}`);
+    }
+
+    const db = loadMockDb();
+    const found = db.orders.find((o) => matchesOrderRef(o, orderRef));
+    return found ? clone(found) : null;
   },
 
   /**
@@ -333,8 +486,66 @@ export const apiClient = {
       throw new Error('Cannot place an empty order.');
     }
 
-    const tableNumber =
-      orderPayload.orderType === 'dine-in' ? targetSlot.dineInTablesCount + 1 : null;
+    let tableNumber = null;
+    const isDineIn = orderPayload.orderType === 'dine-in';
+    const slotIsPeak = isPeakSlot(targetSlot, slots);
+
+    // TODO: Enforce peak-hour 15-min max duration on backend
+    const rawRequestedDuration = Number(orderPayload.durationMins) || (slotIsPeak ? PEAK_MAX_DURATION_MINS : 30);
+    const maxAllowedForSlot = slotIsPeak ? PEAK_MAX_DURATION_MINS : 60;
+    const peakDurationCapped = isDineIn && slotIsPeak && rawRequestedDuration > PEAK_MAX_DURATION_MINS;
+    const durationMins = isDineIn
+      ? Math.max(10, Math.min(maxAllowedForSlot, rawRequestedDuration))
+      : null;
+
+    if (isDineIn) {
+      const tableAvailability = computeTablesAvailability(
+        db.orders,
+        CANTEEN_TABLES,
+        targetSlot.id,
+        durationMins
+      );
+      const takenTables = getBookedTableSetForSlot(db, targetSlot.id);
+      const rawTableRef = orderPayload.tableNumber ?? orderPayload.tableId;
+      const requestedNum = rawTableRef
+        ? Number(String(rawTableRef).replace(/^t/i, '').trim())
+        : null;
+
+      if (requestedNum && Number.isInteger(requestedNum) && requestedNum >= 1 && requestedNum <= 10) {
+        const entry = tableAvailability.find((t) => t.number === requestedNum);
+        if (takenTables.has(requestedNum) || entry?.isBooked) {
+          const err = new Error(
+            `Table T${requestedNum} is already booked at ${targetSlot.id}${
+              entry?.bookedRange ? ` (${entry.bookedRange})` : ''
+            }.`
+          );
+          err.code = 'TABLE_TAKEN';
+          throw err;
+        }
+        if (entry?.hasConflict) {
+          const err = new Error(
+            `Table T${requestedNum} has a booking at ${entry.conflictAt}. Pick a shorter duration or open table.`
+          );
+          err.code = 'TABLE_DURATION_CONFLICT';
+          throw err;
+        }
+        tableNumber = requestedNum;
+      } else {
+        const conflictFree = tableAvailability.find(
+          (t) => !t.isBooked && !takenTables.has(t.number) && !t.hasConflict
+        );
+        const anyFree = tableAvailability.find((t) => !t.isBooked && !takenTables.has(t.number));
+        if (conflictFree) {
+          tableNumber = conflictFree.number;
+        } else if (anyFree) {
+          tableNumber = anyFree.number;
+        } else {
+          tableNumber = targetSlot.dineInTablesCount + 1;
+        }
+      }
+    }
+
+    const rangeInfo = isDineIn ? formatTimeRange(targetSlot.id, durationMins) : null;
 
     const newOrder = {
       id: `ord-${Date.now().toString(36)}`,
@@ -342,8 +553,13 @@ export const apiClient = {
       studentId: orderPayload.studentId,
       studentName: orderPayload.studentName || 'Campus Student',
       slotId: targetSlot.id,
-      orderType: orderPayload.orderType === 'dine-in' ? 'dine-in' : 'takeaway',
+      orderType: isDineIn ? 'dine-in' : 'takeaway',
+      durationMins,
+      peakDurationCapped,
+      endSlotTime: rangeInfo ? rangeInfo.endLabel : null,
+      timeRangeLabel: rangeInfo ? rangeInfo.compactRange : null,
       tableNumber,
+      tableId: tableNumber ? `T${tableNumber}` : null,
       status: 'PLACED',
       createdAt: new Date().toISOString(),
       items: verifiedItems,
@@ -353,6 +569,15 @@ export const apiClient = {
     db.orders.unshift(newOrder);
     saveMockDb(db);
     return clone(newOrder);
+  },
+
+  /**
+   * Canonical slot & table reservation wrapper enforcing peak-hour 15-min cap rules.
+   * // TODO: Enforce peak-hour 15-min max duration on backend (POST /api/orders)
+   */
+  async bookSlotAndOrder(orderPayload) {
+    // TODO: Enforce peak-hour 15-min max duration on backend
+    return this.createOrder(orderPayload);
   },
 
   /**
@@ -371,13 +596,23 @@ export const apiClient = {
     }
 
     const db = loadMockDb();
-    const order = db.orders.find((o) => o.id === orderId);
+    const order = db.orders.find((o) => matchesOrderRef(o, orderId));
     if (!order) {
       throw new Error(`Order ${orderId} not found.`);
     }
-    order.status = status;
+    const normalizedStatus = String(status || '').trim().toUpperCase() || 'READY';
+    order.status = normalizedStatus;
+    if (normalizedStatus === 'READY' && order.orderType === 'dine-in' && !order.seatedAt) {
+      order.seatedAt = new Date().toISOString();
+    }
     order.updatedAt = new Date().toISOString();
     saveMockDb(db);
+    broadcastLiveSync({
+      type: 'ORDER_STATUS_UPDATED',
+      orderId: order.id,
+      token: order.token,
+      status: normalizedStatus === 'READY' ? 'Ready' : normalizedStatus
+    });
     return clone(order);
   },
 
@@ -442,6 +677,7 @@ export const apiClient = {
       rating: 4.8,
       category: itemPayload.isVeg ? 'Veg Specials' : 'Chef Specials',
       artKey: 'custom',
+      image: itemPayload.image || './assets/dishes/custom.jpg',
       description:
         itemPayload.description ||
         `Freshly prepared ${cleanName} added live by the Canteen Manager.`,
@@ -492,19 +728,210 @@ export const apiClient = {
     const seeded = {
       menu: clone(INITIAL_MENU),
       slotsMeta: clone(INITIAL_SLOTS_META),
-      orders: clone(INITIAL_ORDERS)
+      orders: clone(INITIAL_ORDERS),
+      prepAdjustments: []
     };
     saveMockDb(seeded);
     return seeded;
   },
 
   /**
-   * Real-time cross-tab sync (Mock Mode via `storage` event) or WebSocket in production.
+   * Lists Manager-approved smart batch prep recommendations pushed to KDS.
+   * // TODO: Connect Backend Endpoint -> GET /api/analytics/prep-adjustments
+   */
+  async getPrepAdjustments() {
+    if (!USE_MOCK_API) {
+      // TODO: Connect Backend Endpoint -> requires staff Authorization Bearer token
+      return request('/analytics/prep-adjustments', {
+        staffAuth: true
+      });
+    }
+
+    const db = loadMockDb();
+    return clone(db.prepAdjustments || []);
+  },
+
+  /**
+   * Applies a smart recommendation from Manager Insights and pushes batch prep target to KDS.
+   * // TODO: Connect Backend Endpoint -> POST /api/analytics/recommendations/apply
+   *
+   * @param {{ id: string, title: string, itemName: string, deltaQty: number, slotId: string, note?: string }} recommendation
+   */
+  async applyPrepRecommendation(recommendation) {
+    if (!USE_MOCK_API) {
+      // TODO: Connect Backend Endpoint -> requires staff Authorization Bearer token & x-staff-role header
+      return request('/analytics/recommendations/apply', {
+        method: 'POST',
+        body: recommendation,
+        staffAuth: true
+      });
+    }
+
+    const db = loadMockDb();
+    if (!Array.isArray(db.prepAdjustments)) {
+      db.prepAdjustments = [];
+    }
+
+    const recId = String(recommendation?.id || `rec-${Date.now().toString(36)}`);
+    const entry = {
+      id: recId,
+      title: recommendation?.title || 'Batch Prep Adjustment',
+      itemName: recommendation?.itemName || 'Masala Dosa',
+      deltaQty: Number(recommendation?.deltaQty) || 12,
+      slotId: recommendation?.slotId || '12:30',
+      note: recommendation?.note || 'Applied via Canteen Manager Insights',
+      appliedAt: Date.now()
+    };
+
+    const existingIdx = db.prepAdjustments.findIndex((item) => item.id === recId);
+    if (existingIdx >= 0) {
+      db.prepAdjustments[existingIdx] = entry;
+    } else {
+      db.prepAdjustments.unshift(entry);
+    }
+
+    saveMockDb(db);
+    broadcastLiveSync({ type: 'PREP_ADJUSTMENT_APPLIED', adjustment: entry });
+    return clone(entry);
+  },
+
+  /**
+   * Fetches aggregated Demand Prediction & Food Waste Insights for the Canteen Manager portal.
+   * // TODO: Connect Backend Endpoint -> GET /api/analytics/insights
+   */
+  async getOrderInsights() {
+    if (!USE_MOCK_API) {
+      // TODO: Connect Backend Endpoint -> requires staff Authorization Bearer token
+      return request('/analytics/insights', {
+        staffAuth: true
+      });
+    }
+
+    const db = loadMockDb();
+    const validOrders = (db.orders || []).filter((o) => o.status !== 'CANCELLED');
+    const baselineOrders = 832; // Realistic daily campus lunch baseline + live active orders
+    const totalOrdersToday = baselineOrders + validOrders.length;
+
+    const dishCounts = {};
+    for (const order of validOrders) {
+      for (const line of order.items || []) {
+        dishCounts[line.name] = (dishCounts[line.name] || 0) + Number(line.qty || 1);
+      }
+    }
+
+    return {
+      totalOrdersToday,
+      liveOrdersCount: validOrders.length,
+      foodWasteRate: 18,
+      wasteReductionPct: 35,
+      predictionAccuracy: 92,
+      costSaved: 1250 + validOrders.length * 18,
+      dishCounts,
+      prepAdjustments: clone(db.prepAdjustments || [])
+    };
+  },
+
+  /**
+   * Real-time order status listener for instant "Order Ready!" alerts.
+   * // TODO: Connect Supabase Realtime / WebSocket / SSE listener
+   *
+   * @param {string|null} orderId - Specific order ID to watch, or null to watch all order updates
+   * @param {(order: object, meta: object) => void} callback - Invoked when order status changes
+   * @returns {() => void} Unsubscribe cleanup function
+   */
+  subscribeToOrderUpdates(orderId, callback) {
+    if (!USE_MOCK_API) {
+      // TODO: Connect Supabase Realtime / WebSocket / SSE listener
+      // Example:
+      // const es = new EventSource(`${API_BASE_URL}/orders/${orderId || 'stream'}/events`);
+      // es.onmessage = (evt) => callback(JSON.parse(evt.data), { type: 'SSE_ORDER_UPDATE' });
+      // return () => es.close();
+      const ws = new WebSocket(
+        `${WS_BASE_URL}?role=${encodeURIComponent(activeRole)}${
+          orderId ? `&orderId=${encodeURIComponent(orderId)}` : ''
+        }`
+      );
+      ws.addEventListener('message', (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          if (!orderId || payload?.id === orderId || payload?.order?.id === orderId) {
+            callback(payload.order || payload, { type: 'WS_ORDER_UPDATE' });
+          }
+        } catch {
+          // Ignore malformed frame
+        }
+      });
+      return () => ws.close();
+    }
+
+    const statusCache = new Map();
+    loadMockDb().orders.forEach((o) => statusCache.set(o.id, o.status));
+
+    const inspectOrders = (sourceType, evtPayload = null) => {
+      const db = loadMockDb();
+      const candidates = orderId
+        ? db.orders.filter((o) => matchesOrderRef(o, orderId))
+        : db.orders;
+
+      for (const ord of candidates) {
+        const prevStatus = statusCache.get(ord.id);
+        const explicitlyUpdated =
+          evtPayload?.type === 'ORDER_STATUS_UPDATED' && matchesOrderRef(ord, evtPayload.orderId || evtPayload.token);
+
+        if (prevStatus !== ord.status || explicitlyUpdated) {
+          statusCache.set(ord.id, ord.status);
+          callback(clone(ord), {
+            type: sourceType,
+            prevStatus: prevStatus || null,
+            nextStatus: ord.status,
+            orderId: ord.id,
+            status: ord.status === 'READY' ? 'Ready' : ord.status
+          });
+        }
+      }
+    };
+
+    const handleLocal = () => inspectOrders('LOCAL_SYNC');
+    const handleStorage = (evt) => {
+      if (!evt.key || evt.key === STORAGE_KEY) {
+        inspectOrders('CROSS_TAB_SYNC');
+      }
+    };
+
+    let channel = null;
+    const handleBroadcast = (msg) => {
+      const data = msg?.data || {};
+      inspectOrders(data.type || 'CROSS_TAB_SYNC', data);
+    };
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel(REALTIME_CHANNEL);
+        channel.addEventListener('message', handleBroadcast);
+      }
+    } catch {
+      channel = null;
+    }
+
+    window.addEventListener(UPDATE_EVENT, handleLocal);
+    window.addEventListener('storage', handleStorage);
+
+    return () => {
+      window.removeEventListener(UPDATE_EVENT, handleLocal);
+      window.removeEventListener('storage', handleStorage);
+      if (channel) {
+        channel.removeEventListener('message', handleBroadcast);
+        channel.close();
+      }
+    };
+  },
+
+  /**
+   * Real-time cross-tab sync (Mock Mode via `storage` + `BroadcastChannel`) or WebSocket in production.
    * // TODO: Connect Backend WebSocket -> ws://.../ws/updates
    */
   subscribeToUpdates(onUpdate) {
     if (!USE_MOCK_API) {
-      // TODO: Replace with authenticated WebSocket / SSE listener
+      // TODO: Connect Supabase Realtime / WebSocket / SSE listener
       const staffSession = getStaffSession();
       const wsRole = staffSession?.role || activeRole;
       const ws = new WebSocket(`${WS_BASE_URL}?role=${encodeURIComponent(wsRole)}`);
@@ -526,12 +953,30 @@ export const apiClient = {
       }
     };
 
+    let channel = null;
+    const handleBroadcast = (msg) => {
+      const data = msg?.data || {};
+      onUpdate({ ...data, type: data.type || 'CROSS_TAB_SYNC' });
+    };
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel(REALTIME_CHANNEL);
+        channel.addEventListener('message', handleBroadcast);
+      }
+    } catch {
+      channel = null;
+    }
+
     window.addEventListener(UPDATE_EVENT, handleLocal);
     window.addEventListener('storage', handleStorage);
 
     return () => {
       window.removeEventListener(UPDATE_EVENT, handleLocal);
       window.removeEventListener('storage', handleStorage);
+      if (channel) {
+        channel.removeEventListener('message', handleBroadcast);
+        channel.close();
+      }
     };
   }
 };

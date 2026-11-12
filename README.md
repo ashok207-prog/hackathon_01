@@ -1,37 +1,54 @@
-# hackathon_01 — CampusBite (Canteen Queue & Pre-Order System)
+<!-- Problem Statement -->
 
-> Attending our first Hackathon in college • **Frontend Workspace**
+College canteens often experience heavy crowds during lunch breaks and peak hours. This creates several problems:
 
-Standalone, zero-dependency, modular frontend built for a 5-hour college hackathon. Runs out-of-the-box offline with `localStorage` persistence and cross-tab sync, and connects cleanly to your backend REST/WebSocket APIs by flipping one constant (`USE_MOCK_API = false`) in [`src/services/apiClient.js`](src/services/apiClient.js).
+<!-- Our Vision -->
 
-## Quick Start (Zero Build Step)
+    Our vision is to build a smarter campus ecosystem where students spend less time waiting for food and more time focusing on what matters.
 
-Because this app uses native ES Modules (`<script type="module">`), serve the folder over HTTP:
+        CampusBite — Order Smart. Eat Fresh. Save Time! 🍽️
 
-```bash
-python -m http.server 8080
-```
 
-Then open `http://localhost:8080` in Chrome/Edge (or `http://localhost:8080/#staff` for the PIN-protected Staff & Manager Portal, demo PIN `1234`).
+<!-- Project Information -->
 
-> **Tip for Multi-Screen Pitch Demos:** Open `http://localhost:8080` in **Window 1 (Student)** and `http://localhost:8080/#staff` in **Window 2 (Kitchen KDS / Manager)**. Updates sync live across tabs via `localStorage` events!
+Project Name: CampusBite
 
-## Folder Architecture
+Project Title: Smart Canteen Queue, Pre-Order & Table Booking System
 
-- `index.html` — Entry shell
-- `styles/tokens.css`, `styles/main.css` — Obsidian & Forest Emerald dark glassmorphic tokens, slot-first mobile layout & wide KDS/Manager grids
-- `assets/dishes/` — High-contrast dish photography thumbnails (with inline SVG fallbacks in `foodArt.js`)
-- `src/services/apiClient.js` — Centralized REST + WebSocket client (`const USE_MOCK_API = true;`)
-- `src/data/mockSeed.js` — Seeded campus menu, 10-minute slots, and sample KDS orders
-- `src/utils/nlpOrderParser.js` — Plain-language ordering parser (quantities, dishes, aliases, typos, dine-in/takeaway, slots)
-- `src/utils/qrGenerator.js`, `src/utils/foodArt.js`, `src/utils/icons.js` — Zero-network QR SVGs, dish art & icons
-- `src/views/` — `StudentView.js`, `StaffLoginView.js`, `KitchenView.js`, `ManagerView.js`
-- `src/components/` — `Header.js`, `OrderReadyBanner.js`, `CartDrawer.js`, `DishDetailModal.js`
-- `API_CONTRACT.md` — Exact JSON REST & WebSocket contract for backend teammates
+Project Type: College Hackathon Project
 
-## Judge Pitch Script
+Domain: Web Development | Smart Campus | Food Technology | Digital Management
 
-1. **Plain-Language Ordering:** In Student view, click `"2 masala dosa and 1 cold coffee for 12:30 dine-in"` or type your own prompt — watch items, slot, and dine-in mode populate automatically.
-2. **Load-Balanced Slots & Auto-Suggestion:** Click **"Demo: Fill 12:30 (9/10)"** in the header -> `12:30` turns Amber (`9/10`). Place 1 order -> `12:30` hits `10/10` Red & Locked. Click `12:30` -> automatically suggests and highlights `12:40`.
-3. **Live Kitchen Display (KDS):** Open **Staff Portal** (`#staff`, PIN `1234`) -> choose `Kitchen Staff` -> inspect the **Batch-Cooking Aggregator** (`12:30 Batch: ...`) and click **"Mark Ready"** on ticket `#4821` -> the pulsing **"Order Ready!"** banner immediately triggers for the student.
-4. **Manager Real-Time Slots & Stock Controls:** Switch to `Canteen Manager` -> monitor all 4 booked windows (`12:20`–`12:50`) with the live `T1–T10` table map, toggle items `Out of Stock` / `New Update`, or publish a brand-new dish and immediately order it via plain language in Student view.
+Developed For: Making campus dining faster, smarter, and more convenient.
+
+🚀 Implemented Features
+
+    Smart Ordering: Order food using simple natural-language commands.
+
+    Digital Menu: Food categories, Veg/Non-Veg filters, prices, ratings, and stock status.
+
+    Pre-Ordering: Takeaway and Dine-In options with 10-minute time slots.
+
+    Smart Slot Allocation: Maximum 10 orders per slot with live availability indicators.
+
+    Table Booking: Interactive floor map with 10 tables (4–5 seaters).
+
+    Peak-Hour Management: Automatic 15-minute dining limit during rush hours.
+
+    Order Tracking: Unique pickup token, QR code, and live order status updates.
+
+    Kitchen Display System: Slot-wise orders, batch-cooking aggregation, and order status management.
+
+    Manager Dashboard: Table and slot monitoring, booking management, and menu/stock control.
+
+    Analytics Dashboard: Demand charts, food waste insights, inventory alerts, and smart recommendations.
+
+    Real-Time Synchronization: BroadcastChannel, Storage Events, and live polling.
+
+    Demo Mode: One-click slot population for quick project demonstrations.
+
+    Responsive UI: Dark emerald glassmorphic design for student and staff portals.
+
+🛠️ Technology Stack
+
+HTML5 • CSS3 • JavaScript • LocalStorage • BroadcastChannel API • Web Audio API 

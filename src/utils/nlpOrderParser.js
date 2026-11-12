@@ -1,3 +1,5 @@
+import { PEAK_MAX_DURATION_MINS, isPeakSlot } from './format.js';
+
 /**
  * Plain-Language Order Parser (NLP Heuristic Engine)
  * ---------------------------------------------------------------------------
@@ -150,6 +152,32 @@ function extractTimeSlot(text, availableSlotIds = ['12:20', '12:30', '12:40', '1
 }
 
 /**
+ * Step 2b: Extract dining duration ("for 45 mins", "30 min", "15m", "1 hour", "half hour")
+ * and strip it so duration digits never pollute food quantities.
+ */
+function extractDiningDuration(text) {
+  let working = text;
+  let durationMins = null;
+
+  const hourRegex = /(?:for\s+)?\b(1\s*(?:hr|hour)|half\s*(?:an\s*)?(?:hr|hour))\b/gi;
+  const minRegex = /(?:for\s+)?\b(15|30|45|60)\s*(?:mins?|minutes?|m)\b/gi;
+
+  const hourMatch = hourRegex.exec(working);
+  if (hourMatch) {
+    durationMins = /half/i.test(hourMatch[1]) ? 30 : 60;
+    working = working.replace(hourMatch[0], ' ');
+  } else {
+    const minMatch = minRegex.exec(working);
+    if (minMatch) {
+      durationMins = Number(minMatch[1]);
+      working = working.replace(minMatch[0], ' ');
+    }
+  }
+
+  return { durationMins, remainingText: working };
+}
+
+/**
  * Step 3: Build searchable candidate terms for every live menu item
  * (dish name + configured aliases), sorted longest-first to avoid partial shadows.
  */
@@ -247,7 +275,8 @@ function matchSegmentToDish(segment, candidates) {
 export function parsePlainLanguageOrder(
   rawInput,
   menuItems = [],
-  availableSlotIds = ['12:20', '12:30', '12:40', '12:50']
+  availableSlotIds = ['12:20', '12:30', '12:40', '12:50'],
+  slots = []
 ) {
   if (!rawInput || !rawInput.trim()) {
     return {
@@ -256,6 +285,9 @@ export function parsePlainLanguageOrder(
       slotId: null,
       requestedUnsupportedTime: null,
       orderType: null,
+      durationMins: null,
+      requestedDurationMins: null,
+      wasDurationCapped: false,
       unmatchedSegments: []
     };
   }
@@ -268,8 +300,15 @@ export function parsePlainLanguageOrder(
   // 2. Extract target pickup slot
   const timeResult = extractTimeSlot(modeResult.remainingText, availableSlotIds);
 
+  // 2b. Extract dining duration ("for 45 mins", "1 hour") & apply Peak-Hour 15-min Cap
+  const durationResult = extractDiningDuration(timeResult.remainingText);
+  const rawDuration = durationResult.durationMins;
+  const targetSlotIsPeak = timeResult.slotId ? isPeakSlot(timeResult.slotId, slots) : false;
+  const shouldCapDuration = Boolean(rawDuration && targetSlotIsPeak && rawDuration > PEAK_MAX_DURATION_MINS);
+  const effectiveDuration = shouldCapDuration ? PEAK_MAX_DURATION_MINS : rawDuration;
+
   // 3. Split leftover dish expression into clauses on commas, +, &, "and", "with"
-  const rawSegments = timeResult.remainingText
+  const rawSegments = durationResult.remainingText
     .replace(/\b(and|with|plus)\b/gi, ',')
     .replace(/[+&]/g, ',')
     .split(',')
@@ -309,6 +348,9 @@ export function parsePlainLanguageOrder(
     slotId: timeResult.slotId,
     requestedUnsupportedTime: timeResult.requestedUnsupportedTime,
     orderType: modeResult.orderType,
+    durationMins: effectiveDuration,
+    requestedDurationMins: rawDuration,
+    wasDurationCapped: shouldCapDuration,
     unmatchedSegments
   };
 }
